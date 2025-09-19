@@ -1,0 +1,211 @@
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_IMAGE = 'pdf-qa-app'
+        DOCKER_TAG = "${BUILD_NUMBER}"
+        REGISTRY = 'your-registry.com'
+        KUBECONFIG = credentials('kubeconfig')
+        GEMINI_API_KEY = credentials('gemini-api-key')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                    python -m pip install --upgrade pip
+                    pip install -r requirements.txt
+                    pip install pytest pytest-cov flake8 black
+                '''
+            }
+        }
+        
+        stage('Code Quality') {
+            parallel {
+                stage('Linting') {
+                    steps {
+                        sh 'flake8 app.py --max-line-length=100'
+                    }
+                }
+                stage('Code Formatting') {
+                    steps {
+                        sh 'black --check app.py'
+                    }
+                }
+            }
+        }
+        
+        stage('Unit Tests') {
+            steps {
+                sh '''
+                    pytest tests/ --cov=app --cov-report=xml --cov-report=html
+                '''
+            }
+            post {
+                always {
+                    publishCoverage adapters: [
+                        coberturaAdapter('coverage.xml')
+                    ], sourceFileResolver: sourceFiles('STORE_LAST_BUILD')
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            steps {
+                sh '''
+                    pip install safety bandit
+                    safety check
+                    bandit -r app.py -f json -o bandit-report.json
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'bandit-report.json', fingerprint: true
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    def image = docker.build("${DOCKER_IMAGE}:${DOCKER_TAG}")
+                    env.DOCKER_IMAGE_ID = image.id
+                }
+            }
+        }
+        
+        stage('Container Security Scan') {
+            steps {
+                sh '''
+                    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                        -v $HOME/Library/Caches:/root/.cache/ \
+                        aquasec/trivy:latest image ${DOCKER_IMAGE}:${DOCKER_TAG}
+                '''
+            }
+        }
+        
+        stage('Integration Tests') {
+            steps {
+                sh '''
+                    docker-compose -f docker-compose.test.yml up -d
+                    sleep 30
+                    pytest tests/integration/ --maxfail=1
+                '''
+            }
+            post {
+                always {
+                    sh 'docker-compose -f docker-compose.test.yml down'
+                }
+            }
+        }
+        
+        stage('Performance Tests') {
+            steps {
+                sh '''
+                    docker run --rm -i --network host \
+                        loadimpact/k6:latest run - < tests/performance/load_test.js
+                '''
+            }
+        }
+        
+        stage('Push to Registry') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                script {
+                    docker.withRegistry("https://${REGISTRY}", 'registry-credentials') {
+                        def image = docker.image("${DOCKER_IMAGE}:${DOCKER_TAG}")
+                        image.push()
+                        image.push('latest')
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                sh '''
+                    helm upgrade --install pdf-qa-staging ./helm-chart \
+                        --set image.tag=${DOCKER_TAG} \
+                        --set environment=staging \
+                        --namespace staging
+                '''
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                input message: 'Deploy to production?', ok: 'Deploy'
+                sh '''
+                    helm upgrade --install pdf-qa-prod ./helm-chart \
+                        --set image.tag=${DOCKER_TAG} \
+                        --set environment=production \
+                        --namespace production
+                '''
+            }
+        }
+        
+        stage('Model Validation') {
+            steps {
+                sh '''
+                    python scripts/model_validation.py \
+                        --model-version ${BUILD_NUMBER} \
+                        --threshold 0.85
+                '''
+            }
+        }
+        
+        stage('Update MLflow') {
+            steps {
+                sh '''
+                    python scripts/mlflow_logging.py \
+                        --run-id ${BUILD_NUMBER} \
+                        --git-commit ${GIT_COMMIT_SHORT} \
+                        --docker-tag ${DOCKER_TAG}
+                '''
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            slackSend(
+                channel: '#mlops',
+                color: 'good',
+                message: "✅ Pipeline succeeded for ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+            )
+        }
+        failure {
+            slackSend(
+                channel: '#mlops',
+                color: 'danger',
+                message: "❌ Pipeline failed for ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+            )
+        }
+    }
+}
